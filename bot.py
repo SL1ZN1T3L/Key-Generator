@@ -22,7 +22,6 @@ from dotenv import load_dotenv
 BOT_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(BOT_DIR, 'logs')
 
-# Загружаем переменные окружения из .env файла
 load_dotenv()
 
 try:
@@ -42,12 +41,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Инициализация бота и диспетчера
 bot = Bot(token=os.getenv("BOT_TOKEN"))
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
-# --- Состояния для машины состояний (FSM) ---
 class SshSteps(StatesGroup):
     main_menu = State()
     choose_key_type = State()
@@ -60,7 +57,7 @@ class SshSteps(StatesGroup):
     wait_for_2fa = State()
 
 
-# --- Клавиатуры ---
+# Херня типо клавиатуры
 main_menu_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="🔑 Сгенерировать новый ключ")],
@@ -93,8 +90,6 @@ cancel_export_keyboard = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-
-# --- Обработчики команд ---
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
@@ -273,7 +268,6 @@ async def back_to_main_menu_from_type_choice(message: Message, state: FSMContext
     """Возврат в главное меню"""
     await cmd_start(message, state)
 
-# --- Логика SSH ---
 
 async def export_key_to_server(message: Message, user_data: Dict[str, Any], is_existing: bool = False):
     """Функция для подключения к серверу и экспорта ключа"""
@@ -313,8 +307,6 @@ async def export_key_to_server(message: Message, user_data: Dict[str, Any], is_e
         state = dp.fsm.resolve_context(bot, chat_id, chat_id)
         await state.set_state(SshSteps.main_menu)
 
-
-# --- НАЧАЛО БЛОКА НА ЗАМЕНУ ---
 
 class CustomSshClient(asyncssh.SSHClient):
     """
@@ -470,7 +462,6 @@ async def handle_ssh_connection(message: Message, state: FSMContext):
         )
         await state.set_state(SshSteps.main_menu)
 
-# --- КОНЕЦ БЛОКА НА ЗАМЕНУ ---
 
 async def main():
     """Основная функция для запуска бота"""
