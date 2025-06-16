@@ -85,6 +85,14 @@ export_keyboard = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
+# Новая клавиатура для отмены при экспорте существующего ключа
+cancel_export_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Отмена")]
+    ],
+    resize_keyboard=True
+)
+
 
 # --- Обработчики команд ---
 
@@ -112,7 +120,7 @@ async def start_existing_key_export(message: Message, state: FSMContext):
     """Начало процесса экспорта существующего ключа"""
     await message.answer(
         "Хорошо. Пожалуйста, отправьте мне ваш **публичный** SSH-ключ (содержимое файла .pub).",
-        reply_markup=ReplyKeyboardRemove(),
+        reply_markup=cancel_export_keyboard, # Используем новую клавиатуру с отменой
         parse_mode="Markdown"
     )
     await state.set_state(SshSteps.get_existing_public_key)
@@ -121,13 +129,18 @@ async def start_existing_key_export(message: Message, state: FSMContext):
 @dp.message(StateFilter(SshSteps.get_existing_public_key))
 async def process_existing_public_key(message: Message, state: FSMContext):
     """Получение публичного ключа от пользователя"""
+    if message.text == "Отмена":
+        await cmd_start(message, state)
+        return
+
     if not message.text or not message.text.startswith(("ssh-rsa", "ssh-ed25519")):
-        await message.answer("Это не похоже на публичный SSH-ключ. Пожалуйста, попробуйте снова.")
+        await message.answer("Это не похоже на публичный SSH-ключ. Пожалуйста, попробуйте снова или нажмите 'Отмена'.", reply_markup=cancel_export_keyboard)
         return
 
     await state.update_data(public_key=message.text)
     await message.answer(
         "✅ Публичный ключ принят. Теперь, пожалуйста, отправьте мне ваш **приватный** ключ.",
+        reply_markup=cancel_export_keyboard, # Кнопка отмены сохраняется
         parse_mode="Markdown"
     )
     await state.set_state(SshSteps.get_existing_private_key)
@@ -136,8 +149,12 @@ async def process_existing_public_key(message: Message, state: FSMContext):
 @dp.message(StateFilter(SshSteps.get_existing_private_key))
 async def process_existing_private_key(message: Message, state: FSMContext):
     """Получение приватного ключа и переход к вводу данных сервера"""
+    if message.text == "Отмена":
+        await cmd_start(message, state)
+        return
+
     if not message.text or "PRIVATE KEY" not in message.text:
-        await message.answer("Это не похоже на приватный SSH-ключ. Пожалуйста, попробуйте снова.")
+        await message.answer("Это не похоже на приватный SSH-ключ. Пожалуйста, попробуйте снова или нажмите 'Отмена'.", reply_markup=cancel_export_keyboard)
         return
 
     await state.update_data(private_key=message.text)
@@ -145,6 +162,7 @@ async def process_existing_private_key(message: Message, state: FSMContext):
         "✅ Приватный ключ принят. Теперь введите данные для подключения к серверу в формате:\n\n"
         "`имя_пользователя@ip_адрес`"
         "\n\n*Например:* `root@192.168.1.1`",
+        reply_markup=cancel_export_keyboard, # Кнопка отмены сохраняется
         parse_mode="Markdown"
     )
     await state.set_state(SshSteps.get_server_info_for_existing)
@@ -161,31 +179,44 @@ async def generate_key(message: Message, state: FSMContext):
     else:  # Ed25519
         private_key = ed25519.Ed25519PrivateKey.generate()
 
-    # Сериализация приватного ключа
-    pem = private_key.private_bytes(
+    # Сериализация приватного ключа в формате OpenSSH
+    openssh_private_key_bytes = private_key.private_bytes(
         encoding=serialization.Encoding.PEM,
         format=serialization.PrivateFormat.OpenSSH,
         encryption_algorithm=serialization.NoEncryption()
     )
+    openssh_private_key_str = openssh_private_key_bytes.decode('utf-8')
+
+    # Сериализация приватного ключа в формате PEM
+    pem_private_key_bytes = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption()
+    )
+    pem_private_key_str = pem_private_key_bytes.decode('utf-8')
 
     # Сериализация публичного ключа
     public_key = private_key.public_key()
-    ssh_public_key = public_key.public_bytes(
+    ssh_public_key_bytes = public_key.public_bytes(
         encoding=serialization.Encoding.OpenSSH,
         format=serialization.PublicFormat.OpenSSH
     )
-
-    private_key_str = pem.decode('utf-8')
-    public_key_str = ssh_public_key.decode('utf-8')
+    public_key_str = ssh_public_key_bytes.decode('utf-8')
 
     # Сохраняем ключи в FSM
-    await state.update_data(private_key=private_key_str, public_key=public_key_str)
+    await state.update_data(private_key=openssh_private_key_str, public_key=public_key_str)
 
     # Отправка ключей пользователю
-    await message.answer("✅ Ваши ключи готовы!\n\n**Приватный ключ** (сохраните его в надежном месте и никому не показывайте):")
+    await message.answer("✅ Ваши ключи готовы!\n\n**Приватный ключ (OpenSSH)** (сохраните его в надежном месте и никому не показывайте):")
     await message.answer_document(
-        BufferedInputFile(private_key_str.encode('utf-8'), filename="id_generated_key"),
-        caption="Ваш приватный ключ."
+        BufferedInputFile(openssh_private_key_str.encode('utf-8'), filename="id_generated_key_openssh"),
+        caption="Ваш приватный ключ в формате OpenSSH."
+    )
+
+    await message.answer("**Приватный ключ (PEM)**:")
+    await message.answer_document(
+        BufferedInputFile(pem_private_key_str.encode('utf-8'), filename="id_generated_key_pem"),
+        caption="Ваш приватный ключ в формате PEM."
     )
 
     await message.answer("**Публичный ключ** (его можно безопасно передавать):")
@@ -202,9 +233,15 @@ async def request_server_info(message: Message, state: FSMContext):
         "Введите данные для подключения в формате:\n\n"
         "`имя_пользователя@ip_адрес`"
         "\n\n*Например:* `root@192.168.1.1`",
-        reply_markup=ReplyKeyboardRemove(),
+        reply_markup=cancel_export_keyboard, # Добавляем Отмену
         parse_mode="Markdown"
     )
+
+@dp.message(StateFilter(SshSteps.get_server_info), lambda message: message.text == "Отмена")
+@dp.message(StateFilter(SshSteps.get_server_info_for_existing), lambda message: message.text == "Отмена")
+async def handle_cancel_during_server_info(message: Message, state: FSMContext):
+    """Обработка кнопки Отмена во время запроса данных сервера"""
+    await cmd_start(message, state)
 
 
 @dp.message(StateFilter(SshSteps.get_server_info), lambda message: '@' in message.text)
@@ -243,6 +280,13 @@ async def export_key_to_server(message: Message, user_data: Dict[str, Any], is_e
     chat_id = message.chat.id
     try:
         server_info = user_data.get('server_info')
+        # Проверяем, что server_info не Отмена
+        if server_info == "Отмена":
+            await bot.send_message(chat_id, "Операция отменена.", reply_markup=main_menu_keyboard)
+            state = dp.fsm.resolve_context(bot, chat_id, chat_id)
+            await state.set_state(SshSteps.main_menu)
+            return
+
         username, host = server_info.split('@')
         public_key = user_data.get('public_key')
         
@@ -251,7 +295,8 @@ async def export_key_to_server(message: Message, user_data: Dict[str, Any], is_e
         # Запрос пароля
         password_message = await bot.send_message(
             chat_id,
-            f"Введите пароль для пользователя `{username}` на сервере `{host}`:",
+            f"Введите пароль для пользователя `{username}` на сервере `{host}`:\n\n*Или нажмите 'Отмена' для возврата в главное меню.*",
+            reply_markup=cancel_export_keyboard, # Добавляем Отмену
             parse_mode="Markdown"
         )
         # Устанавливаем состояние для ожидания пароля
@@ -306,7 +351,8 @@ class CustomSshClient(asyncssh.SSHClient):
         # Отправляем пользователю запрос от сервера
         msg = await self._bot.send_message(
             self._chat_id,
-            f"🔐 Сервер запрашивает:\n`{prompt_text}`\n\nВведите требуемое значение:"
+            f"🔐 Сервер запрашивает:\n`{prompt_text}`\n\nВведите требуемое значение:\n\n*Или нажмите 'Отмена' для возврата в главное меню.*",
+            reply_markup=cancel_export_keyboard # Добавляем Отмену
         )
         # Переводим FSM в состояние ожидания 2FA кода
         await self._state.set_state(SshSteps.wait_for_2fa)
@@ -320,6 +366,24 @@ class CustomSshClient(asyncssh.SSHClient):
 @dp.message(StateFilter(SshSteps.wait_for_2fa))
 async def process_2fa_code(message: Message, state: FSMContext):
     """Этот обработчик ловит только код 2FA от пользователя."""
+    if message.text == "Отмена":
+        # Если пользователь нажал отмену во время 2FA,
+        # нужно завершить future, чтобы asyncssh не завис.
+        user_data = await state.get_data()
+        future = user_data.get("two_fa_future")
+        if future and not future.done():
+            future.cancel() # Отменяем Future
+
+        await message.delete() # Удаляем сообщение с кодом
+        prompt_msg_id = user_data.get('prompt_msg_id')
+        if prompt_msg_id:
+            try:
+                await bot.delete_message(message.chat.id, prompt_msg_id)
+            except: pass
+
+        await cmd_start(message, state) # Возвращаемся в главное меню
+        return
+
     user_data = await state.get_data()
     future = user_data.get("two_fa_future")
 
@@ -350,6 +414,11 @@ async def handle_ssh_connection(message: Message, state: FSMContext):
     password = message.text
     chat_id = message.chat.id
 
+    # Проверяем, если пользователь нажал Отмена во время запроса пароля
+    if password == "Отмена":
+        await cmd_start(message, state)
+        return
+    
     # Удаляем сообщения с паролем и запросом пароля
     try:
         await message.delete()
@@ -370,8 +439,8 @@ async def handle_ssh_connection(message: Message, state: FSMContext):
         client_factory = lambda: CustomSshClient(bot, chat_id, state, password)
 
         async with asyncssh.connect(host, username=username,
-                                    client_factory=client_factory,
-                                    known_hosts=None) as conn:
+                                     client_factory=client_factory,
+                                     known_hosts=None) as conn:
 
             await bot.send_message(chat_id, "✅ Успешное подключение!")
 
