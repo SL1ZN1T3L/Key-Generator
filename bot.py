@@ -310,49 +310,60 @@ async def export_key_to_server(message: Message, user_data: Dict[str, Any], is_e
 
 class CustomSshClient(asyncssh.SSHClient):
     """
-    Класс для обработки интерактивных запросов (пароль, 2FA)
-    для старых версий asyncssh (< 2.0).
+    Класс для обработки интерактивных запросов (пароль, 2FA).
+    Финальная версия, основанная на анализе всех логов для asyncssh v1.x.
     """
     def __init__(self, bot_instance, chat_id, state: FSMContext, password: str):
         self._bot = bot_instance
         self._chat_id = chat_id
         self._state = state
         self._password = password
-        self._2fa_future = None
+        super().__init__()
 
     def password_auth_requested(self):
-        # Отвечаем на запрос пароля
+        """Возвращает пароль по запросу от сервера."""
         return self._password
 
-    def kbdint_auth_requested(self, name, instructions, lang, prompts):
-        # Этот метод вызывается, когда сервер запрашивает 2FA код
-        # (keyboard-interactive authentication)
+    def kbdint_auth_requested(self):
+        """
+        Вызывается БЕЗ аргументов. Должен вернуть ОДНУ СТРОКУ,
+        содержащую подметоды. Пустая строка '' означает "я готов".
+        """
+        return ''  # <--- КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: ВОЗВРАЩАЕМ СТРОКУ, НЕ КОРТЕЖ
+
+    async def kbdint_challenge_received(self, name, instructions, lang, prompts):
+        """
+        Этот метод вызывается для обработки самого 2FA-запроса,
+        ПОСЛЕ успешного ответа от kbdint_auth_requested.
+        """
         if not prompts:
-            return [] # Нечего запрашивать
+            return []
 
-        # Создаем "Future" - обещание, что мы получим ответ позже
-        self._2fa_future = asyncio.get_event_loop().create_future()
+        future = asyncio.get_event_loop().create_future()
+        prompt_text = prompts[0][0]
 
-        # Запускаем асинхронную задачу, которая запросит код у пользователя
-        asyncio.create_task(self._get_2fa_code_from_user(prompts[0][0]))
-
-        # Возвращаем future. AsyncSSH будет ждать, пока он не будет выполнен.
-        return self._2fa_future
-
-    async def _get_2fa_code_from_user(self, prompt_text: str):
-        # Отправляем пользователю запрос от сервера
-        msg = await self._bot.send_message(
-            self._chat_id,
-            f"🔐 Сервер запрашивает:\n`{prompt_text}`\n\nВведите требуемое значение:\n\n*Или нажмите 'Отмена' для возврата в главное меню.*",
-            reply_markup=cancel_export_keyboard # Добавляем Отмену
-        )
-        # Переводим FSM в состояние ожидания 2FA кода
-        await self._state.set_state(SshSteps.wait_for_2fa)
-        # Сохраняем future и id сообщения в FSM для следующего хендлера
-        await self._state.update_data(
-            two_fa_future=self._2fa_future,
-            prompt_msg_id=msg.message_id
-        )
+        try:
+            msg = await self._bot.send_message(
+                self._chat_id,
+                f"🔐 Сервер запрашивает:\n`{prompt_text}`\n\nВведите требуемое последним сообщением или нажмите 'Отмена'.",
+                reply_markup=cancel_export_keyboard,
+                parse_mode="Markdown"
+            )
+            await self._state.set_state(SshSteps.wait_for_2fa)
+            await self._state.update_data(
+                two_fa_future=future,
+                prompt_msg_id=msg.message_id
+            )
+            responses = await future
+            return responses
+        except asyncio.CancelledError:
+            logging.info("Операция 2FA была отменена пользователем.")
+            return []
+        except Exception as e:
+            logging.error(f"Ошибка в процессе запроса 2FA: {e}")
+            if not future.done():
+                future.cancel()
+            raise
 
 
 @dp.message(StateFilter(SshSteps.wait_for_2fa))
@@ -396,22 +407,71 @@ async def process_2fa_code(message: Message, state: FSMContext):
     # Основная логика продолжится в handle_ssh_connection
     await state.set_state(SshSteps.get_server_info)
 
+async def handle_2fa_request_for_user(bot_instance: Bot, chat_id: int, state: FSMContext,
+                                      _name, _instructions, _lang, prompts):
+    """
+    Отдельная асинхронная функция для обработки запросов 2FA (kbd-interactive).
+    Вызывается напрямую библиотекой asyncssh.
+    """
+    if not prompts:
+        return []
 
+    # Создаем "Future" - обещание, что мы получим ответ от пользователя позже
+    future = asyncio.get_event_loop().create_future()
+
+    prompt_text = prompts[0][0]  # Берем текст запроса (например, "Verification code:")
+
+    try:
+        # Отправляем пользователю запрос от сервера
+        msg = await bot_instance.send_message(
+            chat_id,
+            f"🔐 Сервер запрашивает:\n`{prompt_text}`\n\nВведите требуемое значение:\n\n*Или нажмите 'Отмена' для возврата в главное меню.*",
+            reply_markup=cancel_export_keyboard,
+            parse_mode="Markdown"
+        )
+
+        # Переводим FSM в состояние ожидания 2FA кода
+        await state.set_state(SshSteps.wait_for_2fa)
+        # Сохраняем future и id сообщения в FSM для хендлера process_2fa_code
+        await state.update_data(
+            two_fa_future=future,
+            prompt_msg_id=msg.message_id
+        )
+
+        # Ждем, пока хендлер process_2fa_code выполнит future с ответом пользователя
+        responses = await future
+        return responses
+    except Exception as e:
+        # Если что-то пошло не так (например, пользователь заблокировал бота),
+        # отменяем future, чтобы не зависнуть.
+        logging.error(f"Ошибка в процессе запроса 2FA: {e}")
+        if not future.done():
+            future.cancel()
+        raise  # Передаем исключение дальше, чтобы соединение закрылось корректно
+
+
+@dp.message(StateFilter(SshSteps.get_server_info, SshSteps.get_server_info_for_existing))
+@dp.message(StateFilter(SshSteps.get_server_info, SshSteps.get_server_info_for_existing))
 @dp.message(StateFilter(SshSteps.get_server_info, SshSteps.get_server_info_for_existing))
 async def handle_ssh_connection(message: Message, state: FSMContext):
     """
     Основная функция, которая ловит пароль и инициирует SSH подключение.
-    Этот хендлер должен идти ПОСЛЕ хендлеров, которые ожидают `username@host`.
     """
     password = message.text
     chat_id = message.chat.id
 
-    # Проверяем, если пользователь нажал Отмена во время запроса пароля
     if password == "Отмена":
+        try:
+            user_data = await state.get_data()
+            prompt_id = user_data.get('password_prompt_message_id')
+            if prompt_id:
+                await bot.delete_message(chat_id, prompt_id)
+            await message.delete()
+        except Exception:
+            pass
         await cmd_start(message, state)
         return
-    
-    # Удаляем сообщения с паролем и запросом пароля
+
     try:
         await message.delete()
         user_data = await state.get_data()
@@ -427,15 +487,15 @@ async def handle_ssh_connection(message: Message, state: FSMContext):
     public_key = user_data.get('public_key')
 
     try:
-        # Фабрика будет создавать наш кастомный SSH клиент
+        # Фабрика будет создавать наш кастомный SSH клиент, передавая ему все необходимое
         client_factory = lambda: CustomSshClient(bot, chat_id, state, password)
 
+        # Вызываем connect БЕЗ 'kbdint_handler', так как логика теперь внутри CustomSshClient
         async with asyncssh.connect(host, username=username,
                                      client_factory=client_factory,
                                      known_hosts=None) as conn:
 
             await bot.send_message(chat_id, "✅ Успешное подключение!")
-
             command = f'mkdir -p ~/.ssh && echo "{public_key.strip()}" >> ~/.ssh/authorized_keys && chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys'
             result = await conn.run(command, check=True)
 
@@ -444,17 +504,18 @@ async def handle_ssh_connection(message: Message, state: FSMContext):
             else:
                 await bot.send_message(chat_id, f"⚠️ Не удалось добавить ключ. Сервер ответил:\n`{result.stderr}`", parse_mode="Markdown")
 
-    except asyncssh.PermissionDenied as e:
-        await bot.send_message(chat_id, f"❌ Ошибка аутентификации: Неверный пароль или код 2FA. {e}")
+    except asyncssh.PermissionDenied:
+        await bot.send_message(chat_id, "❌ Ошибка аутентификации: Неверный пароль или код 2FA. Попробуйте снова.")
     except asyncssh.ProcessError as e:
         await bot.send_message(chat_id, f"❌ Ошибка выполнения команды на сервере:\n`{e.stderr}`", parse_mode="Markdown")
+    except asyncio.CancelledError:
+        await bot.send_message(chat_id, "Операция отменена.")
     except (asyncssh.Error, OSError) as e:
         await bot.send_message(chat_id, f"❌ Ошибка подключения: {e}")
     except Exception as e:
-        logging.error(f"Неизвестная ошибка при SSH-подключении: {e}")
+        logging.error(f"Неизвестная ошибка при SSH-подключении: {e}", exc_info=True)
         await bot.send_message(chat_id, f"❌ Произошла неизвестная ошибка: {e}")
     finally:
-        # Возвращаемся в главное меню
         await bot.send_message(
             chat_id,
             "Возвращаю в главное меню.",
